@@ -1,0 +1,21 @@
+Log Collector Component (Go): Continuously tails logs from multiple Docker containers. Each container has a dedicated Redis Stream to which logs are pushed for real-time streaming. Logs are also persisted into an InfluxDB database per container for historical training and analysis. The log collector and all container watchers run as concurrent Go routines for high-throughput, non-blocking log ingestion.
+
+Training Component (Python): Periodically queries InfluxDB for container-specific historical logs, preprocesses logs (grouping logs, TF-IDF vectorization), and trains or retrains a container-specific Isolation Forest model. After each training iteration, the new model replaces the previous version in the prediction component. Initially, prediction is deferred until five training cycles have completed. Training runs as a scheduled Python process independent of live log collection.
+
+Prediction Component (Python): Consumes logs from Redis Streams via an API, vectorizes batches of logs, and predicts anomaly scores using the latest Isolation Forest model. Predictions happen in near real-time. Python processes handle model inference, while Go routines handle log streaming and batching.
+
+Alert System (Go): Receives anomaly scores and evaluates them against dynamic thresholds that adapt over time. Alerts are triggered if scores exceed thresholds and categorized by severity. This component runs as Go routines, consuming prediction results asynchronously.
+
+Display / Visualization Component (Go): Provides a real-time dashboard showing triggered alerts, container-level anomaly trends, and model performance. Runs as part of the Go monitoring service.
+
+Data Flow & Dependencies:
+
+Logs → Log Collector (Go, concurrent routines) → Redis Streams → Prediction Component (Python) → Alert System (Go) → Display (Go)
+
+Logs → Log Collector (Go) → InfluxDB → Training Component (Python) → Updated Model → Prediction Component (Python)
+
+Redis Streams provide real-time streaming, replayability, and container-level isolation.
+
+InfluxDB provides high-throughput, time-series persistent storage for logs and historical training.
+
+The entire system is designed for high concurrency using Go routines, with Python processes dedicated solely for ML training and prediction, enabling real-time anomaly detection and adaptive alerting with historical context.

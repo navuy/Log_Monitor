@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  log-streamer:
+    image: log-streamer:1.0.0
+    environment:
+      - REDIS_ADDR=redis:6379
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - logmon-redis
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+networks:
+  logmon-redis:
+    external: true
