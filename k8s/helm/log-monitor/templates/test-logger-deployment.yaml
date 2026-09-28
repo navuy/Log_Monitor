@@ -1,0 +1,58 @@
+{{- if .Values.testLogger.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "log-monitor.testLoggerFullname" . }}
+  namespace: {{ .Values.testLogger.namespace | default .Release.Namespace | quote }}
+  labels:
+    {{- include "log-monitor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test-logger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "log-monitor.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: test-logger
+  template:
+    metadata:
+      labels:
+        {{- include "log-monitor.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: test-logger
+    spec:
+      containers:
+        - name: logger
+          image: "{{ .Values.testLogger.image.repository }}:{{ .Values.testLogger.image.tag }}"
+          imagePullPolicy: {{ .Values.testLogger.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              i=0
+
+              while true; do
+                ts=$(date -Iseconds)
+
+                echo "$ts INFO request_id=req-$i service=test-logger pod=${HOSTNAME} message=\"heartbeat check completed\""
+
+                if [ $((i % 3)) -eq 0 ]; then
+                  echo "$ts WARNING request_id=req-$i service=test-logger pod=${HOSTNAME} component=storage message=\"test warning log from test-logger: disk usage exceeded 80 percent\""
+                fi
+
+                if [ $((i % 5)) -eq 0 ]; then
+                  echo "$ts ERROR request_id=req-$i service=test-logger pod=${HOSTNAME} component=redis message=\"test error log from test-logger: redis connection timeout while publishing event\""
+                fi
+
+                if [ $((i % 7)) -eq 0 ]; then
+                  echo "$ts INFO request_id=req-$i service=test-logger pod=${HOSTNAME} component=rules message=\"regexprobe-$i synthetic regex validation marker\""
+                fi
+
+                if [ $((i % 11)) -eq 0 ]; then
+                  echo "$ts INFO request_id=req-$i service=test-logger pod=${HOSTNAME} component=auth user=svc-$i message=\"login failed for service account with status code 401\""
+                fi
+
+                i=$((i+1))
+                sleep {{ .Values.testLogger.intervalSeconds }}
+              done
+          resources:
+            {{- toYaml .Values.testLogger.resources | nindent 12 }}
+{{- end }}

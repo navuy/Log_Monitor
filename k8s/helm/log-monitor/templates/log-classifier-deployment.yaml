@@ -1,0 +1,71 @@
+{{- if .Values.logClassifier.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "log-monitor.fullname" . }}-log-classifier
+  labels:
+    {{- include "log-monitor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: log-classifier
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "log-monitor.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: log-classifier
+  template:
+    metadata:
+      labels:
+        {{- include "log-monitor.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: log-classifier
+    spec:
+      containers:
+        - name: log-classifier
+          image: "{{ .Values.logClassifier.image.repository }}:{{ .Values.logClassifier.image.tag }}"
+          imagePullPolicy: {{ .Values.logClassifier.image.pullPolicy }}
+          env:
+            - name: REDIS_ADDR
+              value: "{{ include "log-monitor.fullname" . }}-redis:6379"
+            - name: REDIS_STREAM_GLOB
+              value: {{ .Values.logClassifier.redisStreamGlob | quote }}
+            - name: DISCOVER_EVERY
+              value: {{ .Values.logClassifier.discoverEvery | quote }}
+            - name: READ_BLOCK
+              value: {{ .Values.logClassifier.readBlock | quote }}
+            - name: START_FROM_END
+              value: {{ .Values.logClassifier.startFromEnd | quote }}
+            - name: IGNORED_NAMESPACES
+              value: {{ .Values.logClassifier.ignoredNamespaces | quote }}
+            - name: RULE_REFRESH_EVERY
+              value: {{ .Values.logClassifier.ruleRefreshEvery | quote }}
+            - name: INFLUX_URL
+              value: {{ .Values.logClassifier.influx.url | quote }}
+            - name: INFLUX_ORG
+              value: {{ .Values.logClassifier.influx.org | quote }}
+            - name: INFLUX_BUCKET
+              value: {{ .Values.logClassifier.influx.bucket | quote }}
+            - name: POSTGRES_HOST
+              value: {{ include "log-monitor.postgresFullname" . | quote }}
+            - name: POSTGRES_PORT
+              value: {{ .Values.postgres.service.port | quote }}
+            - name: POSTGRES_DATABASE
+              value: {{ .Values.postgres.auth.database | quote }}
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "log-monitor.postgresFullname" . }}-auth
+                  key: user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "log-monitor.postgresFullname" . }}-auth
+                  key: password
+            - name: POSTGRES_SSLMODE
+              value: "disable"
+            - name: INFLUX_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "log-monitor.fullname" . }}-log-classifier-influx
+                  key: token
+          resources:
+            {{- toYaml .Values.logClassifier.resources | nindent 12 }}
+{{- end }}

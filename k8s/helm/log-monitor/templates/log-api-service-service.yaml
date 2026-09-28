@@ -1,0 +1,18 @@
+{{- if .Values.logApiService.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "log-monitor.logApiFullname" . }}
+  labels:
+    {{- include "log-monitor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: log-api-service
+spec:
+  type: {{ .Values.logApiService.service.type }}
+  selector:
+    {{- include "log-monitor.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: log-api-service
+  ports:
+    - name: http
+      port: {{ .Values.logApiService.service.port }}
+      targetPort: http
+{{- end }}

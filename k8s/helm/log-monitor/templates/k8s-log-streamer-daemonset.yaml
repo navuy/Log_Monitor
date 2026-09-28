@@ -1,0 +1,59 @@
+{{- if .Values.k8sLogStreamer.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "log-monitor.streamerFullname" . }}
+  labels:
+    {{- include "log-monitor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: k8s-log-streamer
+spec:
+  selector:
+    matchLabels:
+      {{- include "log-monitor.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: k8s-log-streamer
+  template:
+    metadata:
+      labels:
+        {{- include "log-monitor.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: k8s-log-streamer
+    spec:
+      containers:
+        - name: k8s-log-streamer
+          image: "{{ .Values.k8sLogStreamer.image.repository }}:{{ .Values.k8sLogStreamer.image.tag }}"
+          imagePullPolicy: {{ .Values.k8sLogStreamer.image.pullPolicy }}
+          env:
+            - name: REDIS_ADDR
+              value: {{ printf "%s:%v" (include "log-monitor.redisFullname" .) .Values.redis.service.port | quote }}
+            - name: LOG_DIR
+              value: {{ .Values.k8sLogStreamer.env.logDir | quote }}
+            - name: STREAM_KEY_PREFIX
+              value: {{ .Values.k8sLogStreamer.env.streamKeyPrefix | quote }}
+            - name: STREAM_MAXLEN
+              value: {{ .Values.k8sLogStreamer.env.streamMaxLen | quote }}
+            - name: STREAM_IDLE_TTL
+              value: {{ .Values.k8sLogStreamer.env.streamIdleTTL | quote }}
+            - name: START_FROM_END
+              value: {{ .Values.k8sLogStreamer.env.startFromEnd | quote }}
+            - name: DISCOVERY_INTERVAL
+              value: {{ .Values.k8sLogStreamer.env.discoveryInterval | quote }}
+            - name: READ_INTERVAL
+              value: {{ .Values.k8sLogStreamer.env.readInterval | quote }}
+          resources:
+            {{- toYaml .Values.k8sLogStreamer.resources | nindent 12 }}
+          volumeMounts:
+            - name: varlogcontainers
+              mountPath: {{ .Values.k8sLogStreamer.hostPaths.containers | quote }}
+              readOnly: true
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+      volumes:
+        - name: varlogcontainers
+          hostPath:
+            path: {{ .Values.k8sLogStreamer.hostPaths.containers | quote }}
+            type: Directory
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+            type: Directory
+{{- end }}

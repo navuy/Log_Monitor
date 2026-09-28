@@ -1,0 +1,12 @@
+apiVersion: v2
+name: log-monitor
+description: Kubernetes playground resources for Redis-backed log streaming
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
+dependencies:
+  - name: influxdb2
+    version: "2.1.2"
+    repository: "https://helm.influxdata.com/"
+    condition: influxdb2.enabled

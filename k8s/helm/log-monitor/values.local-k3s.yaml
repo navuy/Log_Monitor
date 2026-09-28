@@ -1,0 +1,36 @@
+fullnameOverride: log-monitor
+
+redis:
+  enabled: true
+
+k8sLogStreamer:
+  enabled: true
+  image:
+    repository: k8s-log-streamer
+    tag: dev
+    pullPolicy: Never
+
+testLogger:
+  enabled: true
+
+logClassifier:
+  image:
+    repository: log-classifier
+    tag: dev
+    pullPolicy: Never
+  ruleRefreshEvery: "10s"
+  influx:
+    token: "dev-token-change-me"
+
+logApiService:
+  enabled: true
+  image:
+    repository: log-api-service
+    tag: dev
+    pullPolicy: Never
+
+influxdb2:
+  adminUser:
+    user: admin
+    password: admin123456
+    token: "dev-token-change-me"

@@ -1,0 +1,53 @@
+{{- if .Values.logApiService.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "log-monitor.logApiFullname" . }}
+  labels:
+    {{- include "log-monitor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: log-api-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "log-monitor.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: log-api-service
+  template:
+    metadata:
+      labels:
+        {{- include "log-monitor.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: log-api-service
+    spec:
+      containers:
+        - name: log-api-service
+          image: "{{ .Values.logApiService.image.repository }}:{{ .Values.logApiService.image.tag }}"
+          imagePullPolicy: {{ .Values.logApiService.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.logApiService.service.port }}
+          env:
+            - name: LISTEN_ADDR
+              value: {{ printf ":%v" .Values.logApiService.service.port | quote }}
+            - name: POSTGRES_HOST
+              value: {{ include "log-monitor.postgresFullname" . | quote }}
+            - name: POSTGRES_PORT
+              value: {{ .Values.postgres.service.port | quote }}
+            - name: POSTGRES_DATABASE
+              value: {{ .Values.postgres.auth.database | quote }}
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "log-monitor.postgresFullname" . }}-auth
+                  key: user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "log-monitor.postgresFullname" . }}-auth
+                  key: password
+            - name: POSTGRES_SSLMODE
+              value: "disable"
+            - name: SEED_RULES_JSON
+              value: {{ .Values.logApiService.seedRules | toJson | quote }}
+          resources:
+            {{- toYaml .Values.logApiService.resources | nindent 12 }}
+{{- end }}
