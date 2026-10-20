@@ -1,10 +1,30 @@
 # Log Monitor Helm Chart
 
-This chart installs:
+This chart deploys the complete active Log Monitor stack.
 
-- Redis for stream storage
-- `k8s-log-streamer` as a DaemonSet
-- an optional noisy test logger deployment
+```mermaid
+flowchart LR
+    Pods[Kubernetes workloads] --> Files[/var/log/containers]
+    Files --> Streamer[k8s-log-streamer DaemonSet]
+    Streamer --> Redis[(Redis Streams)]
+    Redis --> Classifier[log-classifier]
+    API[log-api-service] --> Postgres[(PostgreSQL rules)]
+    Postgres --> Classifier
+    Classifier --> Influx[(InfluxDB alerts)]
+    Test[test-logger] --> Files
+```
+
+## Components
+
+- Redis temporarily buffers one stream per Kubernetes container.
+- `k8s-log-streamer` tails node container logs and publishes enriched entries.
+- PostgreSQL persists keyword/regex rules and their scopes.
+- `log-api-service` provides CRUD operations for rules.
+- Two `log-classifier` replicas dynamically reload rules, share Redis work through `XREADGROUP`, recover stale pending entries, and write matches to InfluxDB.
+- InfluxDB stores the `k8s_log_alerts` measurement.
+- `test-logger` generates INFO, WARNING, ERROR, regex-probe, and authentication-failure samples.
+
+The `log-monitor` namespace is ignored by the classifier, although its logs are still collected into Redis.
 
 ## Local smoke test
 

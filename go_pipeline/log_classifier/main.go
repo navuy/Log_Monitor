@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	"github.com/influxdata/influxdb-client-go/v2/api"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 )
@@ -36,9 +38,13 @@ CREATE TABLE IF NOT EXISTS log_match_rules (
 type Config struct {
 	RedisAddr       string
 	RedisStreamGlob string
+	ConsumerGroup   string
+	ConsumerName    string
 	DiscoverEvery   time.Duration
 	ReadBlock       time.Duration
 	StartFromEnd    bool
+	ClaimEvery      time.Duration
+	ClaimMinIdle    time.Duration
 
 	InfluxURL    string
 	InfluxToken  string
@@ -79,9 +85,13 @@ func main() {
 	cfg := Config{
 		RedisAddr:         env("REDIS_ADDR", "log-monitor-redis:6379"),
 		RedisStreamGlob:   env("REDIS_STREAM_GLOB", "logs:k8s*"),
+		ConsumerGroup:     env("CONSUMER_GROUP", "log-classifiers"),
+		ConsumerName:      env("CONSUMER_NAME", hostname()),
 		DiscoverEvery:     durationEnv("DISCOVER_EVERY", 10*time.Second),
 		ReadBlock:         durationEnv("READ_BLOCK", 5*time.Second),
 		StartFromEnd:      boolEnv("START_FROM_END", true),
+		ClaimEvery:        durationEnv("CLAIM_EVERY", 30*time.Second),
+		ClaimMinIdle:      durationEnv("CLAIM_MIN_IDLE", time.Minute),
 		InfluxURL:         env("INFLUX_URL", "http://influxdb:8086"),
 		InfluxToken:       env("INFLUX_TOKEN", ""),
 		InfluxOrg:         env("INFLUX_ORG", "log-monitor"),
@@ -122,8 +132,10 @@ func main() {
 	}
 
 	log.Printf(
-		"starting log-classifier redis=%s influx=%s bucket=%s postgres=%s/%s ignored_namespaces=%s refresh=%s",
+		"starting log-classifier redis=%s group=%s consumer=%s influx=%s bucket=%s postgres=%s/%s ignored_namespaces=%s refresh=%s",
 		cfg.RedisAddr,
+		cfg.ConsumerGroup,
+		cfg.ConsumerName,
 		cfg.InfluxURL,
 		cfg.InfluxBucket,
 		cfg.PostgresHost,
@@ -139,13 +151,14 @@ func main() {
 	}
 	log.Printf("loaded %d runtime rules from postgres", len(rules))
 
-	streamIDs := map[string]string{}
+	streams := map[string]struct{}{}
 	lastDiscover := time.Time{}
 	lastRuleRefresh := time.Now()
+	lastClaim := time.Now()
 
 	for {
 		if time.Since(lastDiscover) >= cfg.DiscoverEvery {
-			discoverStreams(ctx, rdb, cfg, streamIDs)
+			discoverStreams(ctx, rdb, cfg, streams)
 			lastDiscover = time.Now()
 		}
 
@@ -160,20 +173,27 @@ func main() {
 			lastRuleRefresh = time.Now()
 		}
 
-		if len(streamIDs) == 0 {
+		if len(streams) == 0 {
 			time.Sleep(1 * time.Second)
 			continue
 		}
 
-		streamArgs := make([]string, 0, len(streamIDs)*2)
-		for stream := range streamIDs {
-			streamArgs = append(streamArgs, stream)
-		}
-		for _, stream := range streamArgs[:len(streamIDs)] {
-			streamArgs = append(streamArgs, streamIDs[stream])
+		if time.Since(lastClaim) >= cfg.ClaimEvery {
+			claimPendingMessages(ctx, rdb, writeAPI, cfg, streams, rules)
+			lastClaim = time.Now()
 		}
 
-		results, readErr := rdb.XRead(ctx, &redis.XReadArgs{
+		streamArgs := make([]string, 0, len(streams)*2)
+		for stream := range streams {
+			streamArgs = append(streamArgs, stream)
+		}
+		for range streams {
+			streamArgs = append(streamArgs, ">")
+		}
+
+		results, readErr := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    cfg.ConsumerGroup,
+			Consumer: cfg.ConsumerName,
 			Streams: streamArgs,
 			Count:   100,
 			Block:   cfg.ReadBlock,
@@ -183,66 +203,14 @@ func main() {
 				continue
 			}
 
-			log.Printf("xread error: %v", readErr)
+			log.Printf("xreadgroup error: %v", readErr)
 			time.Sleep(1 * time.Second)
 			continue
 		}
 
 		for _, stream := range results {
 			for _, msg := range stream.Messages {
-				streamIDs[stream.Stream] = msg.ID
-
-				entry := normalize(msg.Values)
-				if isIgnoredNamespace(entry["namespace"], cfg.IgnoredNamespaces) {
-					continue
-				}
-
-				match := detectMatch(entry, rules)
-				if match == nil {
-					continue
-				}
-
-				point := influxdb2.NewPoint(
-					"k8s_log_alerts",
-					map[string]string{
-						"namespace":      entry["namespace"],
-						"pod_name":       entry["pod_name"],
-						"container_name": entry["container_name"],
-						"stream":         entry["stream"],
-						"tag":            entry["tag"],
-						"level":          match.Value,
-						"match_type":     match.Type,
-						"rule_name":      match.RuleName,
-					},
-					map[string]interface{}{
-						"log":          entry["log"],
-						"raw":          entry["raw"],
-						"redis_stream": stream.Stream,
-						"redis_id":     msg.ID,
-						"container_id": entry["container_id"],
-						"timestamp":    entry["timestamp"],
-						"ingested_at":  entry["ingested_at"],
-						"rule_id":      match.RuleID,
-						"rule_scope":   match.RuleScope,
-					},
-					parseLogTimestamp(entry["timestamp"]),
-				)
-
-				if err := writeAPI.WritePoint(ctx, point); err != nil {
-					log.Printf("failed to write influx stream=%s id=%s: %v", stream.Stream, msg.ID, err)
-					continue
-				}
-
-				log.Printf(
-					"stored alert match_type=%s rule=%s pattern=%s namespace=%s pod=%s container=%s id=%s",
-					match.Type,
-					match.RuleName,
-					match.Value,
-					entry["namespace"],
-					entry["pod_name"],
-					entry["container_name"],
-					msg.ID,
-				)
+				processMessage(ctx, rdb, writeAPI, cfg, rules, stream.Stream, msg)
 			}
 		}
 	}
@@ -299,7 +267,10 @@ func ensureRulesTable(ctx context.Context, db *sql.DB) error {
 func loadRules(ctx context.Context, db *sql.DB) ([]Rule, error) {
 	rows, err := db.QueryContext(
 		ctx,
-		`SELECT id, name, rule_type, pattern, namespace_scopes, pod_scopes, container_scopes
+		`SELECT id, name, rule_type, pattern,
+		        array_to_json(namespace_scopes)::text,
+		        array_to_json(pod_scopes)::text,
+		        array_to_json(container_scopes)::text
 		 FROM log_match_rules
 		 WHERE enabled = TRUE
 		 ORDER BY id ASC`,
@@ -312,16 +283,26 @@ func loadRules(ctx context.Context, db *sql.DB) ([]Rule, error) {
 	rules := make([]Rule, 0)
 	for rows.Next() {
 		var rule Rule
+		var namespaceScopesJSON, podScopesJSON, containerScopesJSON string
 		if err := rows.Scan(
 			&rule.ID,
 			&rule.Name,
 			&rule.RuleType,
 			&rule.Pattern,
-			&rule.NamespaceScopes,
-			&rule.PodScopes,
-			&rule.ContainerScopes,
+			&namespaceScopesJSON,
+			&podScopesJSON,
+			&containerScopesJSON,
 		); err != nil {
 			return nil, err
+		}
+		if err := decodeScopes(namespaceScopesJSON, &rule.NamespaceScopes); err != nil {
+			return nil, fmt.Errorf("decode namespace scopes for rule %d: %w", rule.ID, err)
+		}
+		if err := decodeScopes(podScopesJSON, &rule.PodScopes); err != nil {
+			return nil, fmt.Errorf("decode pod scopes for rule %d: %w", rule.ID, err)
+		}
+		if err := decodeScopes(containerScopesJSON, &rule.ContainerScopes); err != nil {
+			return nil, fmt.Errorf("decode container scopes for rule %d: %w", rule.ID, err)
 		}
 
 		rule.RuleType = strings.ToLower(strings.TrimSpace(rule.RuleType))
@@ -345,8 +326,22 @@ func loadRules(ctx context.Context, db *sql.DB) ([]Rule, error) {
 	return rules, rows.Err()
 }
 
-func discoverStreams(ctx context.Context, rdb *redis.Client, cfg Config, streamIDs map[string]string) {
+func decodeScopes(value string, destination *[]string) error {
+	if strings.TrimSpace(value) == "" || value == "null" {
+		*destination = []string{}
+		return nil
+	}
+
+	return json.Unmarshal([]byte(value), destination)
+}
+
+func discoverStreams(ctx context.Context, rdb *redis.Client, cfg Config, streams map[string]struct{}) {
 	var cursor uint64
+	discovered := map[string]struct{}{}
+	startID := "0-0"
+	if cfg.StartFromEnd {
+		startID = "$"
+	}
 
 	for {
 		keys, next, err := rdb.Scan(ctx, cursor, cfg.RedisStreamGlob, 100).Result()
@@ -356,22 +351,139 @@ func discoverStreams(ctx context.Context, rdb *redis.Client, cfg Config, streamI
 		}
 
 		for _, key := range keys {
-			if _, exists := streamIDs[key]; exists {
-				continue
-			}
+			discovered[key] = struct{}{}
+			if _, exists := streams[key]; !exists {
+				err := rdb.XGroupCreateMkStream(ctx, key, cfg.ConsumerGroup, startID).Err()
+				if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+					log.Printf("failed to create consumer group stream=%s group=%s: %v", key, cfg.ConsumerGroup, err)
+					continue
+				}
 
-			if cfg.StartFromEnd {
-				streamIDs[key] = "$"
-			} else {
-				streamIDs[key] = "0-0"
+				streams[key] = struct{}{}
+				log.Printf("discovered redis stream=%s group=%s start_id=%s", key, cfg.ConsumerGroup, startID)
 			}
-
-			log.Printf("discovered redis stream=%s start_id=%s", key, streamIDs[key])
 		}
 
 		cursor = next
 		if cursor == 0 {
 			break
+		}
+	}
+
+	for stream := range streams {
+		if _, exists := discovered[stream]; !exists {
+			delete(streams, stream)
+			log.Printf("removed expired redis stream=%s", stream)
+		}
+	}
+}
+
+func processMessage(
+	ctx context.Context,
+	rdb *redis.Client,
+	writeAPI api.WriteAPIBlocking,
+	cfg Config,
+	rules []Rule,
+	stream string,
+	msg redis.XMessage,
+) {
+	entry := normalize(msg.Values)
+	if isIgnoredNamespace(entry["namespace"], cfg.IgnoredNamespaces) {
+		ackMessage(ctx, rdb, cfg.ConsumerGroup, stream, msg.ID)
+		return
+	}
+
+	match := detectMatch(entry, rules)
+	if match == nil {
+		ackMessage(ctx, rdb, cfg.ConsumerGroup, stream, msg.ID)
+		return
+	}
+
+	point := influxdb2.NewPoint(
+		"k8s_log_alerts",
+		map[string]string{
+			"namespace":      entry["namespace"],
+			"pod_name":       entry["pod_name"],
+			"container_name": entry["container_name"],
+			"stream":         entry["stream"],
+			"tag":            entry["tag"],
+			"level":          match.Value,
+			"match_type":     match.Type,
+			"rule_name":      match.RuleName,
+		},
+		map[string]interface{}{
+			"log":          entry["log"],
+			"raw":          entry["raw"],
+			"redis_stream": stream,
+			"redis_id":     msg.ID,
+			"container_id": entry["container_id"],
+			"timestamp":    entry["timestamp"],
+			"ingested_at":  entry["ingested_at"],
+			"rule_id":      match.RuleID,
+			"rule_scope":   match.RuleScope,
+		},
+		parseLogTimestamp(entry["timestamp"]),
+	)
+
+	if err := writeAPI.WritePoint(ctx, point); err != nil {
+		log.Printf("failed to write influx stream=%s id=%s; leaving message pending: %v", stream, msg.ID, err)
+		return
+	}
+
+	log.Printf(
+		"stored alert match_type=%s rule=%s pattern=%s namespace=%s pod=%s container=%s id=%s",
+		match.Type,
+		match.RuleName,
+		match.Value,
+		entry["namespace"],
+		entry["pod_name"],
+		entry["container_name"],
+		msg.ID,
+	)
+	ackMessage(ctx, rdb, cfg.ConsumerGroup, stream, msg.ID)
+}
+
+func ackMessage(ctx context.Context, rdb *redis.Client, group, stream, messageID string) {
+	if err := rdb.XAck(ctx, stream, group, messageID).Err(); err != nil {
+		log.Printf("failed to acknowledge stream=%s id=%s group=%s: %v", stream, messageID, group, err)
+	}
+}
+
+func claimPendingMessages(
+	ctx context.Context,
+	rdb *redis.Client,
+	writeAPI api.WriteAPIBlocking,
+	cfg Config,
+	streams map[string]struct{},
+	rules []Rule,
+) {
+	for stream := range streams {
+		start := "0-0"
+		for {
+			messages, next, err := rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+				Stream:   stream,
+				Group:    cfg.ConsumerGroup,
+				Consumer: cfg.ConsumerName,
+				MinIdle:  cfg.ClaimMinIdle,
+				Start:    start,
+				Count:    100,
+			}).Result()
+			if err != nil {
+				if err != redis.Nil {
+					log.Printf("xautoclaim error stream=%s group=%s: %v", stream, cfg.ConsumerGroup, err)
+				}
+				break
+			}
+
+			for _, msg := range messages {
+				log.Printf("reclaimed pending message stream=%s id=%s consumer=%s", stream, msg.ID, cfg.ConsumerName)
+				processMessage(ctx, rdb, writeAPI, cfg, rules, stream, msg)
+			}
+
+			if next == "0-0" || next == start {
+				break
+			}
+			start = next
 		}
 	}
 }
@@ -535,6 +647,14 @@ func env(key, fallback string) string {
 	}
 
 	return fallback
+}
+
+func hostname() string {
+	value, err := os.Hostname()
+	if err != nil || strings.TrimSpace(value) == "" {
+		return "log-classifier"
+	}
+	return value
 }
 
 func durationEnv(key string, fallback time.Duration) time.Duration {

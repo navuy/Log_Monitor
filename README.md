@@ -1,45 +1,59 @@
-# Adaptive Log Anomaly Detection System
+# Log Monitor
 
-## Project Description
+Log Monitor is a Kubernetes log collection and rule-based alerting system. It tails container logs from every node, buffers them in Redis Streams, dynamically loads keyword and regex rules from PostgreSQL, and stores matched alerts in InfluxDB.
 
-An intelligent log monitoring platform that automatically detects anomalies in Docker container logs using machine learning with continuous adaptive learning. The system combines real-time stream processing with periodic model retraining to evolve alongside changing application behavior.
+```mermaid
+flowchart LR
+    Workloads[Kubernetes workloads] --> Logs[/var/log/containers]
+    Logs --> Streamer[k8s-log-streamer]
+    Streamer --> Redis[(Redis Streams)]
+    Redis --> Classifier[log-classifier]
+    API[log-api-service] --> Postgres[(PostgreSQL)]
+    Postgres --> Classifier
+    Classifier --> Influx[(InfluxDB)]
+    Operator[Operator or UI] --> API
+```
 
-### What It Does
+## Runtime flow
 
-This system monitors logs from Docker containers in real-time and identifies unusual patterns that may indicate security threats, system failures, or application errors. Unlike traditional rule-based monitoring, it uses machine learning (Isolation Forest) to learn what "normal" looks like for each container and automatically adapts as your applications evolve.
+1. Kubernetes writes container stdout/stderr to node log files.
+2. One `k8s-log-streamer` pod per node tails those files and uses `XADD` to publish enriched entries to Redis.
+3. Two classifier replicas share a Redis consumer group and consume assigned entries with `XREADGROUP`.
+4. Before matching, it discards entries from globally ignored namespaces such as `log-monitor`.
+5. It applies enabled PostgreSQL rules in ID order and stops at the first match.
+6. Matching entries are written to the InfluxDB measurement `k8s_log_alerts`; unmatched entries are not persisted there.
+7. Successfully evaluated entries are acknowledged with `XACK`; failed InfluxDB writes remain pending for recovery.
+8. Rule changes made through the API are picked up by the classifier on its next refresh without a redeployment.
 
-### Key Capabilities
+## Active components
 
-**Adaptive Learning**: Models retrain periodically on historical data, continuously improving accuracy and reducing false positives as they learn your application's normal behavior patterns.
+- [Kubernetes log streamer](go_pipeline/k8s-log-streamer/README.md)
+- [Log classifier](go_pipeline/log_classifier/README.md)
+- [Rule API service](go_pipeline/log_api_service/README.md)
+- [Kubernetes and Helm deployment](k8s/helm/log-monitor/README.md)
 
-**Real-Time Detection**: Sub-second anomaly detection using Redis Streams for immediate awareness of potential issues.
+## Infrastructure
 
-**Container-Specific Intelligence**: Each container gets its own dedicated model, ensuring anomalies are detected based on that specific application's context rather than generic rules.
+- Redis provides bounded, temporary per-container streams.
+- PostgreSQL stores rules and namespace/pod/container scope arrays.
+- InfluxDB stores matched alerts for querying and visualization.
+- The Helm test logger emits predictable messages for validating keyword and regex rules.
 
-**Scalable Architecture**: Go-based log collection handles thousands of logs per second with concurrent processing, while Python handles the ML workload.
+## Prototype and legacy components
 
-**Zero Downtime Updates**: Models retrain and update automatically without interrupting real-time monitoring.
+- [Docker log streamer](go_pipeline/log_streamer/README.md) is the older Docker API collector.
+- [Log generator](go_pipeline/log_generator/README.md) replays a text file into container stdout.
+- [ML pipeline](ml_pipeline/README.md) contains disconnected TF-IDF and Isolation Forest experiments.
 
-### How It Works
+The ML prototype is not part of the current Helm-deployed runtime.
 
-1. **Log Collection**: Go service tails Docker container logs via Docker socket and streams them to Redis
-2. **Persistence**: Logs are stored in InfluxDB time-series database for historical analysis
-3. **Training**: Python service periodically queries InfluxDB, trains Isolation Forest models on historical data using TF-IDF vectorization
-4. **Prediction**: Separate Python service consumes live logs from Redis Streams, vectorizes them, and scores them against the latest trained model
-5. **Alerting**: Anomalies exceeding configurable thresholds are immediately flagged for investigation
+## Local deployment
 
-### Technology Stack
+The local script builds the three custom images, imports them into k3s containerd, updates Helm dependencies, installs the chart, and waits for the workloads:
 
-- **Go** - High-performance log collection and streaming
-- **Python** - Machine learning training and inference
-- **Redis Streams** - Real-time message streaming with consumer groups
-- **InfluxDB** - Time-series storage for historical logs
-- **scikit-learn** - Isolation Forest anomaly detection
-- **Docker Swarm** - Container orchestration
+```bash
+./k8s/scripts/deploy-local-k3s.sh
+```
 
-### Why This Approach
-
-Traditional log monitoring relies on predefined rules and thresholds that quickly become outdated as applications change. This system learns what's normal for each application and adapts automatically, reducing alert fatigue while catching genuine anomalies that fixed rules would miss.
-
-The adaptive retraining ensures the system improves over time - as your applications evolve, the models evolve with them, maintaining high accuracy without manual rule updates.
+See [k8s/README.md](k8s/README.md) for deployment details.
 

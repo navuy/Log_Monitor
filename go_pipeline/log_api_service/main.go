@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -43,10 +44,27 @@ type Config struct {
 	PostgresPassword string
 	PostgresSSLMode  string
 	SeedRulesJSON    string
+	InfluxURL        string
+	InfluxToken      string
+	InfluxOrg        string
+	InfluxBucket     string
+	AdminUser        string
+	AdminPassword    string
+	SessionSecret    string
 }
 
 type App struct {
-	db *sql.DB
+	db           *sql.DB
+	influx       influxdb2.Client
+	influxOrg    string
+	influxBucket string
+	adminUser    string
+	adminPass    string
+	sessionKey   []byte
+}
+
+type rowScanner interface {
+	Scan(dest ...interface{}) error
 }
 
 type Rule struct {
@@ -85,6 +103,13 @@ func main() {
 		PostgresPassword: env("POSTGRES_PASSWORD", "logmonitor"),
 		PostgresSSLMode:  env("POSTGRES_SSLMODE", "disable"),
 		SeedRulesJSON:    env("SEED_RULES_JSON", ""),
+		InfluxURL:        env("INFLUX_URL", "http://log-monitor-influxdb2:80"),
+		InfluxToken:      env("INFLUX_TOKEN", ""),
+		InfluxOrg:        env("INFLUX_ORG", "log-monitor"),
+		InfluxBucket:     env("INFLUX_BUCKET", "k8s-logs"),
+		AdminUser:        env("ADMIN_USER", "admin"),
+		AdminPassword:    env("ADMIN_PASSWORD", "admin"),
+		SessionSecret:    env("SESSION_SECRET", "local-development-secret"),
 	}
 
 	db, err := sql.Open("pgx", cfg.postgresDSN())
@@ -106,10 +131,17 @@ func main() {
 		log.Fatalf("seed rule init failed: %v", err)
 	}
 
-	app := &App{db: db}
+	influx := influxdb2.NewClient(cfg.InfluxURL, cfg.InfluxToken)
+	defer influx.Close()
+	app := &App{db: db, influx: influx, influxOrg: cfg.InfluxOrg, influxBucket: cfg.InfluxBucket,
+		adminUser: cfg.AdminUser, adminPass: cfg.AdminPassword, sessionKey: []byte(cfg.SessionSecret)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", app.handleHealth)
+	mux.HandleFunc("/api/login", app.handleLogin)
+	mux.Handle("/api/dashboard", app.requireLogin(http.HandlerFunc(app.handleDashboard)))
+	mux.Handle("/api/rules", app.requireLogin(http.HandlerFunc(app.handleRules)))
+	mux.Handle("/api/rules/", app.requireLogin(http.HandlerFunc(app.handleRuleByID)))
 	mux.HandleFunc("/rules", app.handleRules)
 	mux.HandleFunc("/rules/", app.handleRuleByID)
 
@@ -255,7 +287,11 @@ func (a *App) handleRuleByID(w http.ResponseWriter, r *http.Request) {
 func (a *App) listRules(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.db.QueryContext(
 		r.Context(),
-		`SELECT id, name, rule_type, pattern, enabled, namespace_scopes, pod_scopes, container_scopes, created_at, updated_at
+		`SELECT id, name, rule_type, pattern, enabled,
+		        array_to_json(namespace_scopes)::text,
+		        array_to_json(pod_scopes)::text,
+		        array_to_json(container_scopes)::text,
+		        created_at, updated_at
 		 FROM log_match_rules
 		 ORDER BY id ASC`,
 	)
@@ -267,19 +303,8 @@ func (a *App) listRules(w http.ResponseWriter, r *http.Request) {
 
 	rules := make([]Rule, 0)
 	for rows.Next() {
-		var rule Rule
-		if err := rows.Scan(
-			&rule.ID,
-			&rule.Name,
-			&rule.RuleType,
-			&rule.Pattern,
-			&rule.Enabled,
-			&rule.NamespaceScopes,
-			&rule.PodScopes,
-			&rule.ContainerScopes,
-			&rule.CreatedAt,
-			&rule.UpdatedAt,
-		); err != nil {
+		rule, err := scanRule(rows)
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -320,15 +345,18 @@ func (a *App) createRule(w http.ResponseWriter, r *http.Request) {
 		enabled = *payload.Enabled
 	}
 
-	var created Rule
 	namespaceScopes := normalizedScopes(payload.NamespaceScopes, payload.NamespaceScope)
 	podScopes := normalizedScopes(payload.PodScopes, payload.PodScope)
 	containerScopes := normalizedScopes(payload.ContainerScopes, payload.ContainerScope)
-	err := a.db.QueryRowContext(
+	created, err := scanRule(a.db.QueryRowContext(
 		r.Context(),
 		`INSERT INTO log_match_rules (name, rule_type, pattern, enabled, namespace_scope, pod_scope, container_scope, namespace_scopes, pod_scopes, container_scopes, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
-		 RETURNING id, name, rule_type, pattern, enabled, namespace_scopes, pod_scopes, container_scopes, created_at, updated_at`,
+		 RETURNING id, name, rule_type, pattern, enabled,
+		           array_to_json(namespace_scopes)::text,
+		           array_to_json(pod_scopes)::text,
+		           array_to_json(container_scopes)::text,
+		           created_at, updated_at`,
 		strings.TrimSpace(payload.Name),
 		normalizedRuleType(payload.RuleType),
 		strings.TrimSpace(payload.Pattern),
@@ -339,18 +367,7 @@ func (a *App) createRule(w http.ResponseWriter, r *http.Request) {
 		namespaceScopes,
 		podScopes,
 		containerScopes,
-	).Scan(
-		&created.ID,
-		&created.Name,
-		&created.RuleType,
-		&created.Pattern,
-		&created.Enabled,
-		&created.NamespaceScopes,
-		&created.PodScopes,
-		&created.ContainerScopes,
-		&created.CreatedAt,
-		&created.UpdatedAt,
-	)
+	))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -376,11 +393,10 @@ func (a *App) updateRule(w http.ResponseWriter, r *http.Request, id int64) {
 		enabled = *payload.Enabled
 	}
 
-	var updated Rule
 	namespaceScopes := normalizedScopes(payload.NamespaceScopes, payload.NamespaceScope)
 	podScopes := normalizedScopes(payload.PodScopes, payload.PodScope)
 	containerScopes := normalizedScopes(payload.ContainerScopes, payload.ContainerScope)
-	err := a.db.QueryRowContext(
+	updated, err := scanRule(a.db.QueryRowContext(
 		r.Context(),
 		`UPDATE log_match_rules
 		 SET name = $2,
@@ -395,7 +411,11 @@ func (a *App) updateRule(w http.ResponseWriter, r *http.Request, id int64) {
 		     container_scopes = $11,
 		     updated_at = NOW()
 		 WHERE id = $1
-		 RETURNING id, name, rule_type, pattern, enabled, namespace_scopes, pod_scopes, container_scopes, created_at, updated_at`,
+		 RETURNING id, name, rule_type, pattern, enabled,
+		           array_to_json(namespace_scopes)::text,
+		           array_to_json(pod_scopes)::text,
+		           array_to_json(container_scopes)::text,
+		           created_at, updated_at`,
 		id,
 		strings.TrimSpace(payload.Name),
 		normalizedRuleType(payload.RuleType),
@@ -407,18 +427,7 @@ func (a *App) updateRule(w http.ResponseWriter, r *http.Request, id int64) {
 		namespaceScopes,
 		podScopes,
 		containerScopes,
-	).Scan(
-		&updated.ID,
-		&updated.Name,
-		&updated.RuleType,
-		&updated.Pattern,
-		&updated.Enabled,
-		&updated.NamespaceScopes,
-		&updated.PodScopes,
-		&updated.ContainerScopes,
-		&updated.CreatedAt,
-		&updated.UpdatedAt,
-	)
+	))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeError(w, http.StatusNotFound, "rule not found")
@@ -452,32 +461,60 @@ func (a *App) deleteRule(w http.ResponseWriter, r *http.Request, id int64) {
 }
 
 func fetchRuleByID(ctx context.Context, db *sql.DB, id int64) (Rule, error) {
-	var rule Rule
-	err := db.QueryRowContext(
+	return scanRule(db.QueryRowContext(
 		ctx,
-		`SELECT id, name, rule_type, pattern, enabled, namespace_scopes, pod_scopes, container_scopes, created_at, updated_at
+		`SELECT id, name, rule_type, pattern, enabled,
+		        array_to_json(namespace_scopes)::text,
+		        array_to_json(pod_scopes)::text,
+		        array_to_json(container_scopes)::text,
+		        created_at, updated_at
 		 FROM log_match_rules
 		 WHERE id = $1`,
 		id,
-	).Scan(
+	))
+}
+
+func scanRule(scanner rowScanner) (Rule, error) {
+	var rule Rule
+	var namespaceScopesJSON, podScopesJSON, containerScopesJSON string
+	err := scanner.Scan(
 		&rule.ID,
 		&rule.Name,
 		&rule.RuleType,
 		&rule.Pattern,
 		&rule.Enabled,
-		&rule.NamespaceScopes,
-		&rule.PodScopes,
-		&rule.ContainerScopes,
+		&namespaceScopesJSON,
+		&podScopesJSON,
+		&containerScopesJSON,
 		&rule.CreatedAt,
 		&rule.UpdatedAt,
 	)
-	return rule, err
+	if err != nil {
+		return Rule{}, err
+	}
+	if err := json.Unmarshal([]byte(namespaceScopesJSON), &rule.NamespaceScopes); err != nil {
+		return Rule{}, fmt.Errorf("decode namespace scopes for rule %d: %w", rule.ID, err)
+	}
+	if err := json.Unmarshal([]byte(podScopesJSON), &rule.PodScopes); err != nil {
+		return Rule{}, fmt.Errorf("decode pod scopes for rule %d: %w", rule.ID, err)
+	}
+	if err := json.Unmarshal([]byte(containerScopesJSON), &rule.ContainerScopes); err != nil {
+		return Rule{}, fmt.Errorf("decode container scopes for rule %d: %w", rule.ID, err)
+	}
+
+	return rule, nil
 }
 
 func parseRuleID(path string) (int64, error) {
-	idStr := strings.TrimPrefix(path, "/rules/")
+	idStr := path
+	for _, prefix := range []string{"/api/rules/", "/rules/"} {
+		if strings.HasPrefix(path, prefix) {
+			idStr = strings.TrimPrefix(path, prefix)
+			break
+		}
+	}
 	idStr = strings.TrimSpace(idStr)
-	if idStr == "" || strings.Contains(idStr, "/") {
+	if idStr == "" || idStr == path || strings.Contains(idStr, "/") {
 		return 0, fmt.Errorf("invalid rule id path")
 	}
 

@@ -46,3 +46,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "log-monitor.logApiFullname" -}}
 {{- printf "%s-log-api-service" (include "log-monitor.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
+
+{{- define "log-monitor.uiFullname" -}}
+{{- printf "%s-ui" (include "log-monitor.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}

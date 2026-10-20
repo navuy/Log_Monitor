@@ -19,6 +19,11 @@ API_IMAGE_TAR_PATH="${API_IMAGE_TAR_PATH:-$ROOT_DIR/log-api-service-dev.tar}"
 API_DOCKERFILE_PATH="${API_DOCKERFILE_PATH:-$ROOT_DIR/go_pipeline/log_api_service/dockerfile}"
 API_BUILD_CONTEXT="${API_BUILD_CONTEXT:-$ROOT_DIR/go_pipeline/log_api_service}"
 
+UI_IMAGE_NAME="${UI_IMAGE_NAME:-log-monitor-ui:dev}"
+UI_IMAGE_TAR_PATH="${UI_IMAGE_TAR_PATH:-$ROOT_DIR/log-monitor-ui-dev.tar}"
+UI_DOCKERFILE_PATH="${UI_DOCKERFILE_PATH:-$ROOT_DIR/ui/dockerfile}"
+UI_BUILD_CONTEXT="${UI_BUILD_CONTEXT:-$ROOT_DIR/ui}"
+
 NAMESPACE="${NAMESPACE:-log-monitor}"
 TEST_LOGGER_NAMESPACE="${TEST_LOGGER_NAMESPACE:-test-logger}"
 RELEASE_NAME="${RELEASE_NAME:-log-monitor}"
@@ -56,6 +61,15 @@ docker save "$API_IMAGE_NAME" -o "$API_IMAGE_TAR_PATH"
 echo "Importing API image into k3s containerd"
 sudo k3s ctr images import "$API_IMAGE_TAR_PATH"
 
+echo "Building image: $UI_IMAGE_NAME"
+docker build -t "$UI_IMAGE_NAME" -f "$UI_DOCKERFILE_PATH" "$UI_BUILD_CONTEXT"
+
+echo "Saving image tarball: $UI_IMAGE_TAR_PATH"
+docker save "$UI_IMAGE_NAME" -o "$UI_IMAGE_TAR_PATH"
+
+echo "Importing UI image into k3s containerd"
+sudo k3s ctr images import "$UI_IMAGE_TAR_PATH"
+
 echo "Updating Helm dependencies"
 helm dependency update "$CHART_PATH"
 
@@ -76,6 +90,7 @@ kubectl rollout status -n "$TEST_LOGGER_NAMESPACE" deployment/log-monitor-test-l
 kubectl rollout status -n "$NAMESPACE" daemonset/log-monitor-k8s-log-streamer --timeout=120s
 kubectl rollout status -n "$NAMESPACE" deployment/log-monitor-log-classifier --timeout=120s
 kubectl rollout status -n "$NAMESPACE" deployment/log-monitor-log-api-service --timeout=120s
+kubectl rollout status -n "$NAMESPACE" deployment/log-monitor-ui --timeout=120s
 kubectl rollout status -n "$NAMESPACE" statefulset/"$INFLUXDB_STATEFULSET" --timeout=180s
 
 echo
@@ -133,3 +148,7 @@ echo "http://$INFLUXDB_SERVICE.$NAMESPACE.svc.cluster.local"
 echo
 echo "Log API service URL inside cluster:"
 echo "http://log-monitor-log-api-service.$NAMESPACE.svc.cluster.local:8080"
+echo
+echo "Open the UI locally (keep this running):"
+echo "kubectl port-forward -n $NAMESPACE svc/log-monitor-ui 3000:8080"
+echo "Then browse to http://localhost:3000 and sign in with admin/admin"

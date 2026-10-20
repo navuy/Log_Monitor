@@ -48,6 +48,29 @@ spec:
               value: "disable"
             - name: SEED_RULES_JSON
               value: {{ .Values.logApiService.seedRules | toJson | quote }}
+            - name: INFLUX_URL
+              value: {{ .Values.logApiService.influx.url | quote }}
+            - name: INFLUX_ORG
+              value: {{ .Values.logApiService.influx.org | quote }}
+            - name: INFLUX_BUCKET
+              value: {{ .Values.logApiService.influx.bucket | quote }}
+            - name: INFLUX_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "log-monitor.logApiFullname" . }}-auth
+                  key: influx-token
+            - name: ADMIN_USER
+              value: {{ .Values.logApiService.admin.username | quote }}
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "log-monitor.logApiFullname" . }}-auth
+                  key: admin-password
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "log-monitor.logApiFullname" . }}-auth
+                  key: session-secret
           resources:
             {{- toYaml .Values.logApiService.resources | nindent 12 }}
 {{- end }}

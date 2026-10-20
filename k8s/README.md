@@ -1,38 +1,61 @@
-# Kubernetes Deployment Layout
+# Kubernetes Deployment
 
-This folder contains the Kubernetes-facing deployment assets for the log monitor playground.
+This folder contains the Helm chart and local k3s lifecycle scripts for the active Log Monitor stack.
 
-## Structure
+```mermaid
+flowchart TB
+    Deploy[deploy-local-k3s.sh] --> Build[Build custom images]
+    Build --> Import[Import images into k3s containerd]
+    Import --> Helm[Helm upgrade/install]
+    Helm --> Stack[Redis + PostgreSQL + InfluxDB + services]
+```
 
-- `helm/log-monitor`
-  - Helm chart for Redis, `k8s-log-streamer`, and the optional test logger
-- `scripts/deploy-local-k3s.sh`
-  - Build the collector image, save it as a tarball, import it into k3s, and install the chart
-- `scripts/undeploy-local-k3s.sh`
-  - Remove the local k3s deployment
+## Layout
+
+- `helm/log-monitor` contains templates and values for the complete stack.
+- `scripts/deploy-local-k3s.sh` builds/imports images and installs or upgrades the release.
+- `scripts/undeploy-local-k3s.sh` removes the release and namespaces.
+
+The chart deploys:
+
+- Redis
+- PostgreSQL with persistent storage
+- InfluxDB with persistent storage
+- `k8s-log-streamer` as a DaemonSet
+- `log-classifier` as a Deployment
+- `log-api-service` and its ClusterIP Service
+- a BusyBox test logger in the `test-logger` namespace
 
 ## Local k3s workflow
 
-Use this when the cluster runs on the same machine and uses `containerd`.
+From the repository root:
 
 ```bash
 chmod +x k8s/scripts/deploy-local-k3s.sh
 ./k8s/scripts/deploy-local-k3s.sh
 ```
 
-This does five things:
+The script builds and imports these local images:
 
-1. builds `k8s-log-streamer:dev`
-2. saves it as `k8s-log-streamer-dev.tar`
-3. imports it into k3s with `sudo k3s ctr images import`
-4. installs the Helm chart into the `log-monitor` namespace
-5. restarts the collector pod so the DaemonSet uses the imported image
+- `k8s-log-streamer:dev`
+- `log-classifier:dev`
+- `log-api-service:dev`
 
-## Notes
+`values.local-k3s.yaml` uses `imagePullPolicy: Never` for those images, so they must exist inside the k3s containerd image store.
 
-- The image import step uses `sudo k3s ctr images import` because k3s owns the runtime.
-- `values.local-k3s.yaml` sets `imagePullPolicy: Never` so the DaemonSet uses the locally imported image.
-- The chart currently deploys:
-  - Redis
-  - `k8s-log-streamer` as a DaemonSet
-  - a simple busybox test logger
+## Validation
+
+```bash
+kubectl get pods -n log-monitor
+kubectl get pods -n test-logger
+kubectl logs -n log-monitor deploy/log-monitor-log-classifier --tail=50
+kubectl port-forward -n log-monitor svc/log-monitor-log-api-service 8080:8080
+```
+
+Then list rules from another terminal:
+
+```bash
+curl -s http://127.0.0.1:8080/rules | jq
+```
+
+See the [Helm chart README](helm/log-monitor/README.md) for the component diagram and chart-specific commands.

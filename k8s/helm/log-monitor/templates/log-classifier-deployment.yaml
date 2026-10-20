@@ -7,7 +7,7 @@ metadata:
     {{- include "log-monitor.labels" . | nindent 4 }}
     app.kubernetes.io/component: log-classifier
 spec:
-  replicas: 1
+  replicas: {{ .Values.logClassifier.replicaCount }}
   selector:
     matchLabels:
       {{- include "log-monitor.selectorLabels" . | nindent 6 }}
@@ -27,12 +27,22 @@ spec:
               value: "{{ include "log-monitor.fullname" . }}-redis:6379"
             - name: REDIS_STREAM_GLOB
               value: {{ .Values.logClassifier.redisStreamGlob | quote }}
+            - name: CONSUMER_GROUP
+              value: {{ .Values.logClassifier.consumerGroup | quote }}
+            - name: CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: DISCOVER_EVERY
               value: {{ .Values.logClassifier.discoverEvery | quote }}
             - name: READ_BLOCK
               value: {{ .Values.logClassifier.readBlock | quote }}
             - name: START_FROM_END
               value: {{ .Values.logClassifier.startFromEnd | quote }}
+            - name: CLAIM_EVERY
+              value: {{ .Values.logClassifier.claimEvery | quote }}
+            - name: CLAIM_MIN_IDLE
+              value: {{ .Values.logClassifier.claimMinIdle | quote }}
             - name: IGNORED_NAMESPACES
               value: {{ .Values.logClassifier.ignoredNamespaces | quote }}
             - name: RULE_REFRESH_EVERY
