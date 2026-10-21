@@ -26,11 +26,17 @@ type CountItem struct {
 	Count int    `json:"count"`
 }
 
+type TrendSeries struct {
+	Name   string      `json:"name"`
+	Points []CountItem `json:"points"`
+}
+
 type DashboardResponse struct {
 	Total      int         `json:"total"`
 	Namespaces int         `json:"namespaces"`
 	Rules      int         `json:"rules"`
-	Trend      []CountItem `json:"trend"`
+	Trend      []TrendSeries `json:"trend"`
+	Interval   string        `json:"interval"`
 	ByNamespace []CountItem `json:"by_namespace"`
 	ByRule     []CountItem `json:"by_rule"`
 	Alerts     []Alert     `json:"alerts"`
@@ -81,16 +87,82 @@ func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func summarizeAlerts(alerts []Alert, rangeValue string) DashboardResponse {
-	namespaces, rules, trend := map[string]int{}, map[string]int{}, map[string]int{}
+	namespaces, rules := map[string]int{}, map[string]int{}
 	for _, alert := range alerts {
 		namespaces[alert.Namespace]++
 		rules[alert.RuleName]++
-		bucket := alert.Time.UTC().Format("15:00")
-		if rangeValue == "7d" { bucket = alert.Time.UTC().Format("Jan 02") }
-		trend[bucket]++
 	}
 	return DashboardResponse{Total: len(alerts), Namespaces: len(namespaces), Rules: len(rules),
-		Trend: sortedCounts(trend, true), ByNamespace: sortedCounts(namespaces, false), ByRule: sortedCounts(rules, false), Alerts: alerts}
+		Trend: buildTrendSeries(alerts, rangeValue), Interval: trendInterval(rangeValue).String(),
+		ByNamespace: sortedCounts(namespaces, false), ByRule: sortedCounts(rules, false), Alerts: alerts}
+}
+
+func trendInterval(rangeValue string) time.Duration {
+	switch rangeValue {
+	case "1h":
+		return 5 * time.Minute
+	case "6h":
+		return 30 * time.Minute
+	case "7d":
+		return 6 * time.Hour
+	default:
+		return time.Hour
+	}
+}
+
+func trendWindow(rangeValue string) time.Duration {
+	switch rangeValue {
+	case "1h":
+		return time.Hour
+	case "6h":
+		return 6 * time.Hour
+	case "7d":
+		return 7 * 24 * time.Hour
+	default:
+		return 24 * time.Hour
+	}
+}
+
+func buildTrendSeries(alerts []Alert, rangeValue string) []TrendSeries {
+	interval := trendInterval(rangeValue)
+	end := time.Now().UTC().Truncate(interval)
+	start := end.Add(-trendWindow(rangeValue))
+	counts := map[string]map[time.Time]int{}
+
+	for _, alert := range alerts {
+		name := alert.RuleName
+		if name == "" {
+			name = "Other"
+		}
+		bucket := alert.Time.UTC().Truncate(interval)
+		if bucket.Before(start) || bucket.After(end) {
+			continue
+		}
+		if counts[name] == nil {
+			counts[name] = map[time.Time]int{}
+		}
+		counts[name][bucket]++
+	}
+
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	series := make([]TrendSeries, 0, len(names))
+	for _, name := range names {
+		points := make([]CountItem, 0)
+		for bucket := start; !bucket.After(end); bucket = bucket.Add(interval) {
+			label := bucket.Format("15:04")
+			if rangeValue == "7d" {
+				label = bucket.Format("Jan 02 15:00")
+			}
+			points = append(points, CountItem{Name: label, Count: counts[name][bucket]})
+		}
+		series = append(series, TrendSeries{Name: name, Points: points})
+	}
+	return series
 }
 
 func sortedCounts(values map[string]int, byName bool) []CountItem {
